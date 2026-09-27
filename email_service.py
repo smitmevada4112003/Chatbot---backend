@@ -1,0 +1,170 @@
+import os
+import smtplib
+import logging
+from datetime import datetime
+from typing import Optional
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger("low_stock_alerts")
+
+# ==============================================================================
+# SMTP CONFIGURATION FROM ENVIRONMENT (.env)
+# ==============================================================================
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ALERT_RECEIVER_EMAIL = os.getenv("ALERT_RECEIVER_EMAIL", SMTP_USER or "admin@store.com")
+
+# Threshold: Trigger alert when stock <= LOW_STOCK_THRESHOLD
+DEFAULT_LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
+LOW_STOCK_THRESHOLD = DEFAULT_LOW_STOCK_THRESHOLD
+
+
+def send_low_stock_alert(
+    product_name: str,
+    current_stock: int,
+    threshold: int = LOW_STOCK_THRESHOLD,
+    product_id: Optional[int] = None
+) -> dict:
+    """
+    Sends an email alert when product stock drops to or below threshold (or hits 0).
+    
+    Includes:
+      - Product Name and ID
+      - Current Stock Level
+      - Status: "Out of Stock" or "Low Stock"
+      - Timestamp of detection
+      
+    SAFE EXECUTION:
+      Wrapped entirely in try/except so email delivery errors (e.g. network failure,
+      invalid credentials) NEVER crash or interrupt the order-placing flow.
+      Errors are logged to console and server logs.
+    """
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_label = "Out of Stock" if current_stock <= 0 else "Low Stock"
+    prod_id_str = f"#{product_id}" if product_id is not None else "(Not specified)"
+    subject = f"🚨 Stock Alert: {product_name} [{prod_id_str}] is {status_label}"
+
+    plain_content = (
+        f"STOCK ALERT NOTIFICATION\n"
+        f"========================\n"
+        f"Product Name: {product_name}\n"
+        f"Product ID:   {prod_id_str}\n"
+        f"Stock Level:  {current_stock} unit(s)\n"
+        f"Status:       {status_label}\n"
+        f"Threshold:    {threshold} unit(s)\n"
+        f"Timestamp:    {timestamp_str}\n\n"
+        f"{'CRITICAL: Product is completely out of stock!' if current_stock <= 0 else 'Please reorder inventory soon to prevent stockouts.'}"
+    )
+
+    html_content = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color: #111827; background-color: #f9fafb; padding: 20px;">
+        <div style="max-width: 520px; margin: auto; background: #ffffff; border-radius: 8px; border: 1px solid #e5e7eb; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+          <div style="margin-bottom: 16px;">
+            <h2 style="color: {'#b91c1c' if current_stock <= 0 else '#d97706'}; margin: 0;">
+              ⚠️ {status_label.upper()} ALERT
+            </h2>
+          </div>
+          <p style="font-size: 15px; margin: 0 0 16px 0;">
+            Product <strong>{product_name}</strong> is currently at a critical inventory level.
+          </p>
+          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #6b7280;">Product ID:</td>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; font-weight: 600;">{prod_id_str}</td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #6b7280;">Product Name:</td>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; font-weight: 600;">{product_name}</td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #6b7280;">Current Stock:</td>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: {'#dc2626' if current_stock <= 0 else '#d97706'};">
+                {current_stock} unit(s)
+              </td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #6b7280;">Condition:</td>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; font-weight: 600;">
+                <span style="background: {'#fee2e2' if current_stock <= 0 else '#fef3c7'}; color: {'#991b1b' if current_stock <= 0 else '#92400e'}; padding: 2px 8px; border-radius: 4px;">
+                  {status_label}
+                </span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #6b7280;">Detected At:</td>
+              <td style="padding: 8px; border-bottom: 1px solid #e5e7eb; font-weight: 600;">{timestamp_str}</td>
+            </tr>
+          </table>
+          <p style="font-size: 13px; color: #6b7280; margin: 0;">Automated alert generated by Product & Order Assistant.</p>
+        </div>
+      </body>
+    </html>
+    """
+
+    # If SMTP credentials are missing, log clearly and safely exit without breaking order flow
+    if not SMTP_USER or not SMTP_PASSWORD:
+        mock_msg = (
+            f"[MOCK EMAIL ALERT] Product: '{product_name}' (ID: {prod_id_str}) | "
+            f"Stock: {current_stock} ({status_label}) | Time: {timestamp_str} | "
+            f"Add SMTP_USER, SMTP_PASSWORD, and ALERT_RECEIVER_EMAIL to .env to send live emails."
+        )
+        print(f"\n{mock_msg}\n")
+        logger.warning(mock_msg)
+        return {
+            "status": "logged_to_console",
+            "message": mock_msg,
+            "product": product_name,
+            "product_id": product_id,
+            "current_stock": current_stock,
+            "status_label": status_label,
+            "timestamp": timestamp_str
+        }
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_RECEIVER_EMAIL
+
+        msg.attach(MIMEText(plain_content, "plain"))
+        msg.attach(MIMEText(html_content, "html"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, ALERT_RECEIVER_EMAIL, msg.as_string())
+
+        success_msg = f"Stock alert email successfully sent to {ALERT_RECEIVER_EMAIL} for '{product_name}' [{status_label}]."
+        print(f"\n[EMAIL SENT] {success_msg}\n")
+        logger.info(success_msg)
+        return {
+            "status": "sent",
+            "message": success_msg,
+            "product": product_name,
+            "product_id": product_id,
+            "current_stock": current_stock,
+            "status_label": status_label,
+            "timestamp": timestamp_str
+        }
+
+    except Exception as e:
+        # Crucial safeguard: Catch all network/credential errors so order flow continues smoothly
+        error_msg = f"Failed to send stock alert email for '{product_name}': {e}"
+        print(f"\n[EMAIL FAILURE LOGGED] {error_msg}\n")
+        logger.error(error_msg)
+        return {
+            "status": "error_logged",
+            "message": error_msg,
+            "product": product_name,
+            "product_id": product_id,
+            "current_stock": current_stock,
+            "status_label": status_label,
+            "timestamp": timestamp_str
+        }
