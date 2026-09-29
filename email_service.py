@@ -1,8 +1,9 @@
 import os
 import smtplib
 import logging
+import threading
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
@@ -10,6 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("low_stock_alerts")
+
+# Thread-safe registry to ensure background email alerts are sent at most once per order per product
+_svc_order_alerts_lock = threading.Lock()
+_svc_order_alerts_sent = set()  # stores (order_id, product_key)
 
 # ==============================================================================
 # SMTP CONFIGURATION FROM ENVIRONMENT (.env)
@@ -29,7 +34,8 @@ def send_low_stock_alert(
     product_name: str,
     current_stock: int,
     threshold: int = LOW_STOCK_THRESHOLD,
-    product_id: Optional[int] = None
+    product_id: Optional[Any] = None,
+    order_id: Optional[int] = None
 ) -> dict:
     """
     Sends an email alert when product stock drops to or below threshold (or hits 0).
@@ -39,6 +45,7 @@ def send_low_stock_alert(
       - Current Stock Level
       - Status: "Out of Stock" or "Low Stock"
       - Timestamp of detection
+      - Order ID deduplication enforcement
       
     SAFE EXECUTION:
       Wrapped entirely in try/except so email delivery errors (e.g. network failure,
@@ -48,6 +55,28 @@ def send_low_stock_alert(
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     status_label = "Out of Stock" if current_stock <= 0 else "Low Stock"
     prod_id_str = f"#{product_id}" if product_id is not None else "(Not specified)"
+
+    # Deduplication check per order & product
+    if order_id is not None:
+        prod_key = str(product_id) if product_id is not None else product_name.strip().lower()
+        alert_key = (order_id, prod_key)
+        with _svc_order_alerts_lock:
+            if alert_key in _svc_order_alerts_sent:
+                skip_msg = f"[Duplicate Alert Suppressed] Low stock alert for '{product_name}' already sent for order #{order_id}."
+                logger.info(skip_msg)
+                print(skip_msg)
+                return {
+                    "status": "already_sent",
+                    "message": skip_msg,
+                    "product": product_name,
+                    "product_id": product_id,
+                    "current_stock": current_stock,
+                    "status_label": status_label,
+                    "timestamp": timestamp_str
+                }
+            _svc_order_alerts_sent.add(alert_key)
+            if len(_svc_order_alerts_sent) > 5000:
+                _svc_order_alerts_sent.clear()
     subject = f"🚨 Stock Alert: {product_name} [{prod_id_str}] is {status_label}"
 
     plain_content = (

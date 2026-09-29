@@ -1,6 +1,8 @@
 import os
 import smtplib
 import logging
+import threading
+from typing import Optional, Any
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -9,6 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("stock_alerts")
+
+# Thread-safe registry to ensure background email alerts are sent at most once per order per product
+_order_alerts_lock = threading.Lock()
+_order_alerts_sent = set()  # stores (order_id, product_key)
 
 def safe_console_print(msg: str):
     """Safely prints messages to console regardless of terminal encoding (Windows cp1252 / utf-8)."""
@@ -32,7 +38,13 @@ ADMIN_EMAIL = (os.getenv("ADMIN_ALERT_EMAIL") or os.getenv("ADMIN_EMAIL") or SMT
 LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD") or "5")
 
 
-def send_low_stock_alert(product_name: str, product_id: any, current_stock: int, status: str = None) -> dict:
+def send_low_stock_alert(
+    product_name: str,
+    product_id: Any,
+    current_stock: int,
+    status: Optional[str] = None,
+    order_id: Optional[int] = None
+) -> dict:
     """
     Sends an email alert to the admin when product stock reaches 0 or falls below threshold.
     
@@ -41,6 +53,7 @@ def send_low_stock_alert(product_name: str, product_id: any, current_stock: int,
       - product_id (int/str): ID of the product
       - current_stock (int): New stock level after deduction
       - status (str, optional): "Out of Stock" or "Low Stock". If None, calculated automatically.
+      - order_id (int, optional): Order ID to enforce deduplication (at most once per order).
       
     Error Handling:
       Wrapped in try/except so that if sending fails (network error, bad password, etc.),
@@ -50,6 +63,28 @@ def send_low_stock_alert(product_name: str, product_id: any, current_stock: int,
     
     if not status:
         status = "Out of Stock" if current_stock <= 0 else "Low Stock"
+
+    # Deduplication check per order & product
+    if order_id is not None:
+        prod_key = str(product_id) if product_id is not None else product_name.strip().lower()
+        alert_key = (order_id, prod_key)
+        with _order_alerts_lock:
+            if alert_key in _order_alerts_sent:
+                skip_msg = f"[Duplicate Alert Suppressed] Low stock alert for '{product_name}' already triggered for order #{order_id}."
+                logger.info(skip_msg)
+                safe_console_print(skip_msg)
+                return {
+                    "status": "already_sent",
+                    "message": skip_msg,
+                    "product_name": product_name,
+                    "product_id": product_id,
+                    "current_stock": current_stock,
+                    "condition": status,
+                    "timestamp": timestamp
+                }
+            _order_alerts_sent.add(alert_key)
+            if len(_order_alerts_sent) > 5000:
+                _order_alerts_sent.clear()
 
     subject = f"🚨 Stock Alert: {product_name} (ID: #{product_id}) is {status}"
 

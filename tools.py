@@ -1,8 +1,9 @@
+import threading
 from typing import Optional
 from langchain_core.tools import tool
 from databases import get_db_connection
 from email_utils import send_low_stock_alert, LOW_STOCK_THRESHOLD
-from websocket_manager import manager, broadcast_new_order
+from websocket_manager import manager, broadcast_new_order, safe_broadcast_new_order, broadcast_in_background
 
 
 # ---------------- PRODUCT TOOLS ----------------
@@ -242,20 +243,28 @@ def place_order(customer_name: str, product_name: str, quantity: int, user_id: O
         alert_info = ""
         if remaining_stock <= LOW_STOCK_THRESHOLD:
             condition = "Out of Stock" if remaining_stock <= 0 else "Low Stock"
-            alert_res = send_low_stock_alert(
-                product_name=exact_product_name,
-                product_id=prod_id,
-                current_stock=remaining_stock,
-                status=condition
-            )
             alert_info = f" [Alert Triggered: {condition} ({remaining_stock} left)]."
+            try:
+                threading.Thread(
+                    target=send_low_stock_alert,
+                    kwargs={
+                        "product_name": exact_product_name,
+                        "product_id": prod_id,
+                        "current_stock": remaining_stock,
+                        "status": condition,
+                        "order_id": order_id
+                    },
+                    daemon=True
+                ).start()
+            except Exception as mail_thread_err:
+                print(f"[Email Thread Warning] place_order: {mail_thread_err}")
 
         total_price_num = round(unit_price * quantity, 2) if unit_price is not None else 0.0
         total_price_str = f" Total: ₹{total_price_num:,.2f}." if unit_price is not None else ""
 
-        # 6. Broadcast real-time WebSocket notification to open Admin Dashboard sessions asynchronously
+        # 6. Broadcast real-time WebSocket notification to open Admin Dashboard sessions in background
         try:
-            broadcast_new_order({
+            ws_payload = {
                 "id": order_id,
                 "user_id": resolved_user_id,
                 "customer": clean_customer,
@@ -263,7 +272,8 @@ def place_order(customer_name: str, product_name: str, quantity: int, user_id: O
                 "quantity": quantity,
                 "total_amount": total_price_num,
                 "status": "Pending"
-            })
+            }
+            threading.Thread(target=safe_broadcast_new_order, args=(ws_payload,), daemon=True).start()
         except Exception as ws_err:
             print(f"[WebSocket Broadcast Warning] place_order tool: {ws_err}")
         return {
@@ -801,21 +811,32 @@ def checkout_cart(
         cursor.close()
         db.close()
 
-        # Trigger background email alerts
-        for alert in alerts_to_send:
-            try:
-                send_low_stock_alert(
-                    product_name=alert["name"],
-                    product_id=alert["id"],
-                    current_stock=alert["stock"],
-                    status=alert["status"]
-                )
-            except Exception:
-                pass
+        # Trigger background email alerts in a daemon thread (deduplicated per product)
+        def _send_alerts_background(alerts_list, oid):
+            seen_pids = set()
+            for al in alerts_list:
+                if al["id"] not in seen_pids:
+                    seen_pids.add(al["id"])
+                    try:
+                        send_low_stock_alert(
+                            product_name=al["name"],
+                            product_id=al["id"],
+                            current_stock=al["stock"],
+                            status=al["status"],
+                            order_id=oid
+                        )
+                    except Exception as err:
+                        print(f"[Background Alert Error] product #{al.get('id')}: {err}")
 
-        # Broadcast real-time order creation from cart checkout asynchronously
+        if alerts_to_send:
+            try:
+                threading.Thread(target=_send_alerts_background, args=(alerts_to_send, order_id), daemon=True).start()
+            except Exception as thread_err:
+                print(f"[Alert Thread Warning] checkout_cart tool: {thread_err}")
+
+        # Broadcast real-time order creation from cart checkout asynchronously in daemon thread
         try:
-            broadcast_new_order({
+            ws_cart_payload = {
                 "id": order_id,
                 "user_id": resolved_user_id,
                 "customer": resolved_customer,
@@ -823,7 +844,8 @@ def checkout_cart(
                 "quantity": total_quantity,
                 "total_amount": round(total_amount, 2),
                 "status": "Pending"
-            })
+            }
+            threading.Thread(target=safe_broadcast_new_order, args=(ws_cart_payload,), daemon=True).start()
         except Exception as ws_err:
             print(f"[WebSocket Broadcast Warning] checkout_cart tool: {ws_err}")
 

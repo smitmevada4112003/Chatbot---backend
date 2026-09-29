@@ -1,18 +1,32 @@
+import os
+from dotenv import load_dotenv
 import mysql.connector
 
+load_dotenv()
+
 def get_db_connection():
+    host = os.getenv("DB_HOST", "altaria.proxy.rlwy.net")
+    port = int(os.getenv("DB_PORT", "33460"))
+    user = os.getenv("DB_USER", "root")
+    password = os.getenv("DB_PASSWORD", "EuxngIbRGSrwRNYFmjjyEPRfwFKLpbPS")
+    database = os.getenv("DB_NAME", "railway")
+
     return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="productdatabase",
-        connection_timeout=5
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        connection_timeout=10
     )
 
-def ensure_stock_column():
+def ensure_stock_column(db=None):
     """Ensures the 'stock' column exists on the products table."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("SHOW COLUMNS FROM products LIKE 'stock'")
         if not cursor.fetchone():
@@ -20,31 +34,41 @@ def ensure_stock_column():
             db.commit()
             print("[DB Migration] Added 'stock' column with DEFAULT 10 to 'products' table.")
         cursor.close()
-        db.close()
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/add stock column: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def standardize_existing_order_statuses():
+def standardize_existing_order_statuses(db=None):
     """Standardizes existing order status variations in MySQL to 'Cancelled', 'Completed', 'Pending'."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("UPDATE orders SET status = 'Cancelled' WHERE LOWER(TRIM(status)) IN ('cancelled', 'canceled', 'cancel')")
         cursor.execute("UPDATE orders SET status = 'Completed' WHERE LOWER(TRIM(status)) IN ('completed', 'delivered')")
         cursor.execute("UPDATE orders SET status = 'Pending' WHERE LOWER(TRIM(status)) IN ('pending')")
         db.commit()
         cursor.close()
-        db.close()
     except Exception as e:
         print(f"[DB Warning] Could not standardize statuses: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_users_table_and_admin():
+def ensure_users_table_and_admin(db=None):
     """Ensures the 'users' table exists and seeds the default admin user."""
+    should_close = False
     try:
         import os
         from auth_utils import hash_password
 
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -74,14 +98,19 @@ def ensure_users_table_and_admin():
             print(f"[DB Migration] Default admin user initialized: {default_admin_email}")
 
         cursor.close()
-        db.close()
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/create users table: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_orders_user_id_column():
+def ensure_orders_user_id_column(db=None):
     """Ensures the 'user_id' column exists on 'orders' table linked to 'users.id'."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("SHOW COLUMNS FROM orders LIKE 'user_id'")
         if not cursor.fetchone():
@@ -95,14 +124,19 @@ def ensure_orders_user_id_column():
             db.commit()
             print("[DB Migration] Added 'user_id' foreign key column to 'orders' table.")
         cursor.close()
-        db.close()
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/add user_id column to orders: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_password_resets_table():
+def ensure_password_resets_table(db=None):
     """Ensures the 'password_resets' table exists with columns: id, user_id, token, expires_at, used."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS password_resets (
@@ -121,15 +155,20 @@ def ensure_password_resets_table():
         """)
         db.commit()
         cursor.close()
-        db.close()
         print("[DB Migration] Verified/created 'password_resets' table.")
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/create password_resets table: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_email_verifications_table():
+def ensure_email_verifications_table(db=None):
     """Ensures the 'email_verifications' table exists with columns: id, user_id, token, expires_at, used."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS email_verifications (
@@ -152,15 +191,20 @@ def ensure_email_verifications_table():
             cursor.execute("ALTER TABLE users ADD COLUMN is_verified TINYINT(1) NOT NULL DEFAULT 0")
         db.commit()
         cursor.close()
-        db.close()
         print("[DB Migration] Verified/created 'email_verifications' table and 'is_verified' column.")
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/create email_verifications table: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_reviews_table():
+def ensure_reviews_table(db=None):
     """Ensures the 'reviews' table exists with columns: id, product_id, user_id, rating (1-5), comment, created_at."""
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
@@ -183,18 +227,23 @@ def ensure_reviews_table():
         """)
         db.commit()
         cursor.close()
-        db.close()
         print("[DB Migration] Verified/created 'reviews' table.")
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/create reviews table: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-def ensure_cart_and_order_items_tables():
+def ensure_cart_and_order_items_tables(db=None):
     """
     Ensures 'cart_items' and 'order_items' tables exist, and ensures
     'total_amount' column exists on 'orders' table.
     """
+    should_close = False
     try:
-        db = get_db_connection()
+        if db is None:
+            db = get_db_connection()
+            should_close = True
         cursor = db.cursor()
 
         # 1. Cart Items Table
@@ -239,20 +288,30 @@ def ensure_cart_and_order_items_tables():
 
         db.commit()
         cursor.close()
-        db.close()
         print("[DB Migration] Verified/created 'cart_items' and 'order_items' tables.")
     except Exception as e:
         print(f"[DB Migration Warning] Could not verify/create cart and order_items tables: {e}")
+    finally:
+        if should_close and db:
+            db.close()
 
-# Run schema and data normalization on module load
-ensure_stock_column()
-standardize_existing_order_statuses()
-ensure_users_table_and_admin()
-ensure_orders_user_id_column()
-ensure_password_resets_table()
-ensure_email_verifications_table()
-ensure_reviews_table()
-ensure_cart_and_order_items_tables()
+def run_startup_migrations():
+    try:
+        db = get_db_connection()
+        ensure_stock_column(db)
+        standardize_existing_order_statuses(db)
+        ensure_users_table_and_admin(db)
+        ensure_orders_user_id_column(db)
+        ensure_password_resets_table(db)
+        ensure_email_verifications_table(db)
+        ensure_reviews_table(db)
+        ensure_cart_and_order_items_tables(db)
+        db.close()
+    except Exception as e:
+        print(f"[DB Warning] Could not run startup migrations: {e}")
+
+# Run schema and data normalization on module load using single connection
+run_startup_migrations()
 
 
 

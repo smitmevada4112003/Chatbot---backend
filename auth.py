@@ -168,7 +168,7 @@ def get_optional_current_user(credentials: Optional[HTTPAuthorizationCredentials
             "role": role,
             "name": name
         }
-    except JWTError:
+    except Exception:
         return None
 
 

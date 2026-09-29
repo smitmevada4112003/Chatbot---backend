@@ -1,11 +1,18 @@
+import time
+import threading
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel
 from databases import get_db_connection
 from auth import get_current_user, get_optional_current_user, require_admin
-from websocket_manager import manager, broadcast_new_order
+from websocket_manager import manager, broadcast_new_order, safe_broadcast_new_order
+from email_utils import send_low_stock_alert, LOW_STOCK_THRESHOLD
 
 router = APIRouter()
+
+# Thread-safe in-memory cache to prevent duplicate order creation from rapid double-submissions
+_orders_lock = threading.Lock()
+_recent_orders_cache = {}  # key: (user_id, customer, product, quantity) -> (timestamp, response_dict)
 
 
 # =========================
@@ -45,7 +52,7 @@ def get_orders():
     db = get_db_connection()
     cursor = db.cursor()
 
-    cursor.execute("SELECT id, user_id, customer, product, quantity, status FROM orders")
+    cursor.execute("SELECT id, user_id, customer, product, quantity, COALESCE(total_amount, 0.0), status FROM orders ORDER BY id DESC")
 
     rows = cursor.fetchall()
 
@@ -58,7 +65,8 @@ def get_orders():
             "customer": row[2],
             "product": row[3],
             "quantity": row[4],
-            "status": row[5]
+            "total_amount": float(row[5] or 0.0),
+            "status": row[6]
         })
 
     cursor.close()
@@ -87,7 +95,7 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
     if user_id:
         cursor.execute(
             """
-            SELECT id, user_id, customer, product, quantity, COALESCE(CAST(total_amount AS FLOAT), 0.0) AS total_amount, status 
+            SELECT id, user_id, customer, product, quantity, COALESCE(total_amount, 0.0) AS total_amount, status 
             FROM orders 
             WHERE user_id = %s OR (user_id IS NULL AND (LOWER(customer) = %s OR LOWER(customer) = %s))
             ORDER BY id DESC
@@ -97,7 +105,7 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
     else:
         cursor.execute(
             """
-            SELECT id, user_id, customer, product, quantity, COALESCE(CAST(total_amount AS FLOAT), 0.0) AS total_amount, status 
+            SELECT id, user_id, customer, product, quantity, COALESCE(total_amount, 0.0) AS total_amount, status 
             FROM orders 
             WHERE LOWER(customer) = %s OR LOWER(customer) = %s
             ORDER BY id DESC
@@ -106,6 +114,8 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
         )
 
     orders = cursor.fetchall() or []
+    for o in orders:
+        o["total_amount"] = float(o.get("total_amount") or 0.0)
 
     # Attach order items if present
     if orders:
@@ -114,7 +124,7 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
         try:
             cursor.execute(
                 f"""
-                SELECT order_id, product_id, product_name, quantity, CAST(unit_price AS FLOAT) AS unit_price, CAST(subtotal AS FLOAT) AS subtotal
+                SELECT order_id, product_id, product_name, quantity, unit_price, subtotal
                 FROM order_items
                 WHERE order_id IN ({format_strings})
                 """,
@@ -123,6 +133,8 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
             item_rows = cursor.fetchall() or []
             items_by_order = {}
             for item in item_rows:
+                item["unit_price"] = float(item.get("unit_price") or 0.0)
+                item["subtotal"] = float(item.get("subtotal") or 0.0)
                 items_by_order.setdefault(item["order_id"], []).append(item)
             for o in orders:
                 o["items"] = items_by_order.get(o["id"], [])
@@ -136,14 +148,16 @@ def get_my_orders(current_user: dict = Depends(get_current_user)):
     return orders
 
 
-from email_utils import send_low_stock_alert, LOW_STOCK_THRESHOLD
-
 # =========================
-# ADD ORDER
+# ADD ORDER (NON-BLOCKING FAST RESPONSE)
 # =========================
 
 @router.post("/orders")
-def add_order(order: Order, current_user: Optional[dict] = Depends(get_optional_current_user)):
+def add_order(
+    order: Order,
+    background_tasks: BackgroundTasks,
+    current_user: Optional[dict] = Depends(get_optional_current_user)
+):
     # Automatically resolve user_id and customer name from JWT token or payload
     user_id = current_user.get("id") if current_user else order.user_id
     customer_name = (order.customer or "").strip()
@@ -158,80 +172,125 @@ def add_order(order: Order, current_user: Optional[dict] = Depends(get_optional_
     if order.quantity <= 0:
         return {"status": "error", "message": "Quantity must be greater than 0"}
 
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    # Deduplication check for rapid double-submission (within 3.0 seconds)
+    dedup_key = (
+        user_id,
+        customer_name.strip().lower(),
+        order.product.strip().lower(),
+        int(order.quantity)
+    )
+    now = time.time()
+    with _orders_lock:
+        # Prune old cache entries (> 10s)
+        stale_keys = [k for k, (ts, _) in _recent_orders_cache.items() if now - ts > 10.0]
+        for k in stale_keys:
+            del _recent_orders_cache[k]
 
-    # If user_id is not yet set, attempt lookup in users table using customer_name
-    if user_id is None and customer_name:
+        if dedup_key in _recent_orders_cache:
+            prev_time, cached_response = _recent_orders_cache[dedup_key]
+            if now - prev_time < 3.0:
+                print(f"[Duplicate Order Suppressed] Rapid duplicate order for customer '{customer_name}' - '{order.product}' (qty {order.quantity}) received within {now - prev_time:.2f}s. Returning existing order #{cached_response.get('order_id')}.")
+                return cached_response
+
+    db = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+
+        # If user_id is not yet set, attempt lookup in users table using customer_name
+        if user_id is None and customer_name:
+            cursor.execute(
+                "SELECT id FROM users WHERE LOWER(email) = %s OR LOWER(name) = %s LIMIT 1",
+                (customer_name.lower(), customer_name.lower())
+            )
+            u_match = cursor.fetchone()
+            if u_match:
+                user_id = u_match["id"]
+
+        # 1. Check product catalog and available stock
         cursor.execute(
-            "SELECT id FROM users WHERE LOWER(email) = %s OR LOWER(name) = %s LIMIT 1",
-            (customer_name.lower(), customer_name.lower())
+            "SELECT id, name, price, COALESCE(stock, 0) as stock FROM products WHERE LOWER(name) LIKE %s LIMIT 1",
+            (f"%{order.product.strip().lower()}%",)
         )
-        u_match = cursor.fetchone()
-        if u_match:
-            user_id = u_match["id"]
+        product_row = cursor.fetchone()
 
-    # 1. Check product catalog and available stock
-    cursor.execute(
-        "SELECT id, name, CAST(price AS FLOAT) as price, COALESCE(stock, 0) as stock FROM products WHERE LOWER(name) LIKE %s LIMIT 1",
-        (f"%{order.product.strip().lower()}%",)
-    )
-    product_row = cursor.fetchone()
+        if not product_row:
+            cursor.close()
+            return {"status": "error", "message": f"Product '{order.product}' not found in catalog"}
 
-    if not product_row:
+        product_id = product_row["id"]
+        product_name = product_row["name"]
+        current_stock = int(product_row.get("stock") or 0)
+        unit_price = float(product_row.get("price") or 0.0)
+        total_amount = round(unit_price * order.quantity, 2)
+
+        if current_stock < order.quantity:
+            cursor.close()
+            return {
+                "status": "error",
+                "message": f"Insufficient stock for '{product_name}'. Only {current_stock} available, requested {order.quantity}."
+            }
+
+        t_total_start = time.perf_counter()
+
+        # 2. Deduct product stock
+        t_stock_start = time.perf_counter()
+        new_stock = current_stock - order.quantity
+        cursor.execute(
+            "UPDATE products SET stock = %s WHERE id = %s",
+            (new_stock, product_id)
+        )
+        t_stock_ms = (time.perf_counter() - t_stock_start) * 1000
+
+        # 3. Insert order with user_id and total_amount
+        t_db_start = time.perf_counter()
+        cursor.execute(
+            """
+            INSERT INTO orders (user_id, customer, product, quantity, total_amount, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (user_id, customer_name, product_name, order.quantity, total_amount, normalize_status(order.status or "Pending"))
+        )
+        db.commit()
+        order_id = cursor.lastrowid
         cursor.close()
-        db.close()
-        return {"status": "error", "message": f"Product '{order.product}' not found in catalog"}
+        t_db_ms = (time.perf_counter() - t_db_start) * 1000
+    except Exception as db_err:
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        print(f"[Database Error in add_order]: {db_err}")
+        return {"status": "error", "message": f"Database error: {str(db_err)}"}
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
-    product_id = product_row["id"]
-    product_name = product_row["name"]
-    current_stock = product_row["stock"]
-
-    if current_stock < order.quantity:
-        cursor.close()
-        db.close()
-        return {
-            "status": "error",
-            "message": f"Insufficient stock for '{product_name}'. Only {current_stock} available, requested {order.quantity}."
-        }
-
-    # 2. Deduct product stock
-    new_stock = current_stock - order.quantity
-    cursor.execute(
-        "UPDATE products SET stock = %s WHERE id = %s",
-        (new_stock, product_id)
-    )
-
-    # 3. Insert order with user_id
-    cursor.execute(
-        """
-        INSERT INTO orders (user_id, customer, product, quantity, status)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (user_id, customer_name, product_name, order.quantity, normalize_status(order.status or "Pending"))
-    )
-    db.commit()
-    order_id = cursor.lastrowid
-
-    cursor.close()
-    db.close()
-
-    # 4. Check if stock reached 0 or low-stock threshold
+    # 4. Asynchronously queue low-stock email in background task (never blocks HTTP response, isolated failure)
     alert_info = None
-    if new_stock <= LOW_STOCK_THRESHOLD:
-        condition = "Out of Stock" if new_stock <= 0 else "Low Stock"
-        alert_res = send_low_stock_alert(
-            product_name=product_name,
-            product_id=product_id,
-            current_stock=new_stock,
-            status=condition
-        )
-        alert_info = alert_res.get("message")
+    try:
+        if new_stock <= LOW_STOCK_THRESHOLD:
+            condition = "Out of Stock" if new_stock <= 0 else "Low Stock"
+            background_tasks.add_task(
+                send_low_stock_alert,
+                product_name=product_name,
+                product_id=product_id,
+                current_stock=new_stock,
+                status=condition,
+                order_id=order_id
+            )
+            alert_info = f"Low stock alert queued for {product_name} ({new_stock} left)."
+    except Exception as email_err:
+        print(f"[Email Alert Queue Error]: {email_err}")
 
-    # 5. Broadcast real-time WebSocket notification to Admin Dashboards asynchronously
+    # 5. Asynchronously queue WebSocket broadcast in background task (never blocks HTTP response, isolated failure)
     try:
         unit_p = float(product_row["price"] or 0) if product_row else 0.0
-        broadcast_new_order({
+        ws_order_payload = {
             "id": order_id,
             "user_id": user_id,
             "customer": customer_name,
@@ -239,11 +298,26 @@ def add_order(order: Order, current_user: Optional[dict] = Depends(get_optional_
             "quantity": order.quantity,
             "total_amount": round(unit_p * order.quantity, 2),
             "status": normalize_status(order.status or "Pending")
-        })
+        }
+        background_tasks.add_task(safe_broadcast_new_order, ws_order_payload)
     except Exception as ws_err:
-        print(f"[WebSocket Broadcast Warning] orders_api: {ws_err}")
+        print(f"[WebSocket Broadcast Queue Warning] orders_api: {ws_err}")
 
-    return {
+    t_total_ms = (time.perf_counter() - t_total_start) * 1000
+
+    try:
+        print(
+            f"\n[Fast Order Creation - Order #{order_id}]\n"
+            f"  |-- Stock Update:        {t_stock_ms:7.2f} ms\n"
+            f"  |-- DB Insert & Commit:  {t_db_ms:7.2f} ms\n"
+            f"  |-- Background Email:    Queued (non-blocking)\n"
+            f"  |-- WebSocket Broadcast: Queued (non-blocking)\n"
+            f"  +-- HTTP Response Time:  {t_total_ms:7.2f} ms (Immediate)\n"
+        )
+    except Exception:
+        pass
+
+    response_payload = {
         "status": "success",
         "message": "Order added successfully",
         "order_id": order_id,
@@ -254,6 +328,13 @@ def add_order(order: Order, current_user: Optional[dict] = Depends(get_optional_
         "remaining_stock": new_stock,
         "alert": alert_info
     }
+
+    # Cache successful order for deduplication window
+    with _orders_lock:
+        _recent_orders_cache[dedup_key] = (time.time(), response_payload)
+
+    # Return response immediately
+    return response_payload
 
 
 
@@ -323,12 +404,11 @@ def get_orders_summary(admin_user: dict = Depends(require_admin)):
 @router.get("/orders/{order_id}")
 def get_order(order_id: int, admin_user: dict = Depends(require_admin)):
 
-
     db = get_db_connection()
     cursor = db.cursor()
 
     cursor.execute(
-        "SELECT id, user_id, customer, product, quantity, status FROM orders WHERE id = %s",
+        "SELECT id, user_id, customer, product, quantity, COALESCE(total_amount, 0.0), status FROM orders WHERE id = %s",
         (order_id,)
     )
 
@@ -348,7 +428,8 @@ def get_order(order_id: int, admin_user: dict = Depends(require_admin)):
         "customer": row[2],
         "product": row[3],
         "quantity": row[4],
-        "status": row[5]
+        "total_amount": float(row[5] or 0.0),
+        "status": row[6]
     }
 
 
@@ -360,9 +441,16 @@ def get_order(order_id: int, admin_user: dict = Depends(require_admin)):
 def update_order(order_id: int, order: Order, admin_user: dict = Depends(require_admin)):
 
     db = get_db_connection()
-    cursor = db.cursor()
+    cursor = db.cursor(dictionary=True)
 
     clean_status = normalize_status(order.status)
+    cursor.execute(
+        "SELECT id, price FROM products WHERE LOWER(name) LIKE %s LIMIT 1",
+        (f"%{order.product.strip().lower()}%",)
+    )
+    p_row = cursor.fetchone()
+    u_price = float(p_row["price"] or 0.0) if p_row else 0.0
+    tot_amt = round(u_price * order.quantity, 2)
 
     cursor.execute(
         """
@@ -370,6 +458,7 @@ def update_order(order_id: int, order: Order, admin_user: dict = Depends(require
         SET customer = %s,
             product = %s,
             quantity = %s,
+            total_amount = %s,
             status = %s
         WHERE id = %s
         """,
@@ -377,6 +466,7 @@ def update_order(order_id: int, order: Order, admin_user: dict = Depends(require
             order.customer,
             order.product,
             order.quantity,
+            tot_amt,
             clean_status,
             order_id
         )
@@ -394,7 +484,8 @@ def update_order(order_id: int, order: Order, admin_user: dict = Depends(require
                 "status": clean_status,
                 "customer": order.customer,
                 "product": order.product,
-                "quantity": order.quantity
+                "quantity": order.quantity,
+                "total_amount": tot_amt
             }
         })
     except Exception:

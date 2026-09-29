@@ -1,10 +1,11 @@
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from databases import get_db_connection
 from auth import get_current_user
 from email_utils import send_low_stock_alert, LOW_STOCK_THRESHOLD
+from websocket_manager import broadcast_new_order, safe_broadcast_new_order
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
 
@@ -252,6 +253,7 @@ def clear_cart(current_user: dict = Depends(get_current_user)):
 
 @router.post("/checkout")
 def checkout_cart(
+    background_tasks: BackgroundTasks,
     payload: Optional[CheckoutRequest] = None,
     current_user: dict = Depends(get_current_user)
 ):
@@ -259,10 +261,11 @@ def checkout_cart(
     Checks out all items in the customer's cart in a single transaction:
     1. Validates stock for all items.
     2. Deducts inventory.
-    3. Triggers low stock email alerts if necessary.
+    3. Triggers low stock email alerts if necessary in the background (non-blocking).
     4. Creates an order record in `orders` (with total amount and multi-item summary).
     5. Inserts line items into `order_items`.
     6. Clears the customer's cart.
+    7. Returns HTTP response immediately without delay.
     """
     user_id = current_user.get("id")
     if not user_id:
@@ -353,22 +356,23 @@ def checkout_cart(
         # Commit entire transaction
         db.commit()
 
-        # 7. Fire low-stock email alerts (outside of critical DB transaction)
+        # 7. Fire low-stock email alerts in background tasks (never delays HTTP response; deduplicated per product)
+        seen_alert_ids = set()
         for alert in low_stock_alerts_to_send:
-            try:
-                send_low_stock_alert(
+            if alert["id"] not in seen_alert_ids:
+                seen_alert_ids.add(alert["id"])
+                background_tasks.add_task(
+                    send_low_stock_alert,
                     product_name=alert["name"],
                     product_id=alert["id"],
                     current_stock=alert["stock"],
-                    status=alert["status"]
+                    status=alert["status"],
+                    order_id=order_id
                 )
-            except Exception as mail_err:
-                print(f"[Warning] Failed to send low stock alert for {alert['name']}: {mail_err}")
 
-        # Broadcast real-time order creation to Admin Dashboards asynchronously
+        # 8. Broadcast real-time order creation to Admin Dashboards in background
         try:
-            from websocket_manager import broadcast_new_order
-            broadcast_new_order({
+            ws_order_payload = {
                 "id": order_id,
                 "user_id": user_id,
                 "customer": customer_name,
@@ -376,7 +380,8 @@ def checkout_cart(
                 "quantity": total_quantity,
                 "total_amount": round(total_amount, 2),
                 "status": "Pending"
-            })
+            }
+            background_tasks.add_task(safe_broadcast_new_order, ws_order_payload)
         except Exception as ws_err:
             print(f"[WebSocket Broadcast Warning] cart_api checkout: {ws_err}")
 
