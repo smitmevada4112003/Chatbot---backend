@@ -2,13 +2,57 @@ import os
 from dotenv import load_dotenv
 import mysql.connector
 
+import mysql.connector.pooling
+
 load_dotenv()
 
+_connection_pool = None
+
+def get_db_pool():
+    global _connection_pool
+    if _connection_pool is None:
+        host = os.getenv("DB_HOST", "altaria.proxy.rlwy.net")
+        port = int(os.getenv("DB_PORT", "33460"))
+        user = os.getenv("DB_USER", "root")
+        password = os.getenv("DB_PASSWORD", "zzahymaTnAFOjklYreKaTyctFvhrvvXk")
+        database = os.getenv("DB_NAME", "railway")
+
+        try:
+            _connection_pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="app_db_pool",
+                pool_size=10,
+                pool_reset_session=False,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                connection_timeout=20,
+                use_pure=True
+            )
+        except Exception as e:
+            print(f"[DB Warning] Could not initialize connection pool: {e}")
+            _connection_pool = None
+    return _connection_pool
+
 def get_db_connection():
+    pool = get_db_pool()
+    if pool:
+        try:
+            cnx = pool.get_connection()
+            try:
+                cnx.ping(reconnect=True, attempts=2, delay=0.2)
+            except Exception:
+                pass
+            return cnx
+        except Exception:
+            pass
+
+    # Direct fallback if pool is empty or unavailable
     host = os.getenv("DB_HOST", "altaria.proxy.rlwy.net")
     port = int(os.getenv("DB_PORT", "33460"))
     user = os.getenv("DB_USER", "root")
-    password = os.getenv("DB_PASSWORD", "EuxngIbRGSrwRNYFmjjyEPRfwFKLpbPS")
+    password = os.getenv("DB_PASSWORD", "zzahymaTnAFOjklYreKaTyctFvhrvvXk")
     database = os.getenv("DB_NAME", "railway")
 
     return mysql.connector.connect(
@@ -17,7 +61,8 @@ def get_db_connection():
         user=user,
         password=password,
         database=database,
-        connection_timeout=10
+        connection_timeout=20,
+        use_pure=True
     )
 
 def ensure_stock_column(db=None):
@@ -295,7 +340,12 @@ def ensure_cart_and_order_items_tables(db=None):
         if should_close and db:
             db.close()
 
+_migrations_run = False
+
 def run_startup_migrations():
+    global _migrations_run
+    if _migrations_run:
+        return
     try:
         db = get_db_connection()
         ensure_stock_column(db)
@@ -307,6 +357,7 @@ def run_startup_migrations():
         ensure_reviews_table(db)
         ensure_cart_and_order_items_tables(db)
         db.close()
+        _migrations_run = True
     except Exception as e:
         print(f"[DB Warning] Could not run startup migrations: {e}")
 

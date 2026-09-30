@@ -152,7 +152,14 @@ def login(payload: LoginRequest):
             detail="Email and password are required."
         )
 
-    db = get_db_connection()
+    try:
+        db = get_db_connection()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database connection error: {e}. Please check your database connection credentials in Backend/.env."
+        )
+
     cursor = db.cursor(dictionary=True)
 
     try:
