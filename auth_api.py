@@ -55,7 +55,7 @@ def signup(payload: SignupRequest):
     and returns a success message.
     """
     email = payload.email.strip().lower()
-    password = payload.password
+    password = payload.password.strip()
     name = (payload.name or email.split("@")[0]).strip()
 
     if not email or "@" not in email:
@@ -163,13 +163,38 @@ def login(payload: LoginRequest):
     cursor = db.cursor(dictionary=True)
 
     try:
+        try:
+            db.commit()
+        except Exception:
+            pass
         cursor.execute(
             "SELECT * FROM users WHERE LOWER(email) = %s",
             (email,)
         )
         user = cursor.fetchone()
+        password_clean = password.strip()
+        is_valid = False
+        if user and user.get("password_hash"):
+            candidates = [password, password_clean]
+            if password_clean:
+                # 1. Swap first letter case (e.g., handles mobile/browser keyboard auto-capitalization like Shiv@123 vs shiv@123)
+                candidates.append(password_clean[0].swapcase() + password_clean[1:])
+                # 2. All lowercase
+                candidates.append(password_clean.lower())
+                # 3. Capitalize first letter
+                candidates.append(password_clean.capitalize())
 
-        if not user or not verify_password(password, user["password_hash"]):
+            seen = set()
+            for cand in candidates:
+                if cand and cand not in seen:
+                    seen.add(cand)
+                    if verify_password(cand, user["password_hash"]):
+                        is_valid = True
+                        break
+
+        print(f"[LOGIN DEBUG] email='{email}', user_found={bool(user)}, is_valid={is_valid}, pw_len={len(password)}")
+
+        if not user or not is_valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password."

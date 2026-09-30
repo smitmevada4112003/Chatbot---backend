@@ -113,7 +113,8 @@ def create_or_update_review(
             """,
             (product_id,)
         )
-        stats = cursor.fetchone() or {"average_rating": float(rating), "review_count": 1}
+        from cache_utils import products_cache
+        products_cache.invalidate()
 
         return {
             "status": "success",

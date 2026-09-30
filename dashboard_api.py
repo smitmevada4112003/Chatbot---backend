@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from databases import get_db_connection
-from auth_utils import require_admin
+from auth import require_admin
+
+from cache_utils import dashboard_cache
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -11,6 +13,10 @@ def get_dashboard_stats(admin_user: dict = Depends(require_admin)):
     Computes summary metrics, order status breakdowns,
     estimated revenue, and top products.
     """
+    cached = dashboard_cache.get("stats")
+    if cached is not None:
+        return cached
+
     try:
         db = get_db_connection()
         cursor = db.cursor()
@@ -47,12 +53,8 @@ def get_dashboard_stats(admin_user: dict = Depends(require_admin)):
             elif row[0]:
                 status_counts[row[0].strip().title()] = count
 
-        # Calculate estimated revenue by joining orders with products
-        cursor.execute("""
-            SELECT COALESCE(SUM(o.quantity * p.price), 0)
-            FROM orders o
-            JOIN products p ON LOWER(TRIM(o.product)) = LOWER(TRIM(p.name))
-        """)
+        # Fast revenue calculation from total_amount
+        cursor.execute("SELECT COALESCE(SUM(total_amount), 0) FROM orders")
         rev_row = cursor.fetchone()
         estimated_revenue = float(rev_row[0]) if rev_row and rev_row[0] is not None else 0.0
 
@@ -81,7 +83,7 @@ def get_dashboard_stats(admin_user: dict = Depends(require_admin)):
         cursor.close()
         db.close()
 
-        return {
+        result = {
             "status": "success",
             "total_products": total_products,
             "low_stock_count": low_stock_count,
@@ -92,6 +94,10 @@ def get_dashboard_stats(admin_user: dict = Depends(require_admin)):
             "top_products": top_products,
             "recent_orders": recent_orders
         }
+        dashboard_cache.set("stats", result, ttl=4.0)
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

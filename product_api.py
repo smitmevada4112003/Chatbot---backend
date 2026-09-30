@@ -2,7 +2,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from databases import get_db_connection
-from auth_utils import require_admin
+from auth import require_admin
 
 router = APIRouter()
 
@@ -13,9 +13,15 @@ class Product(BaseModel):
     stock: int = 10
 
 
+from cache_utils import products_cache
+
 # GET all products
 @router.get("/products")
 def get_products():
+    cached = products_cache.get("all_products")
+    if cached is not None:
+        return cached
+
     db = get_db_connection()
     cursor = db.cursor()
 
@@ -47,6 +53,7 @@ def get_products():
 
     cursor.close()
     db.close()
+    products_cache.set("all_products", products, ttl=4.0)
     return products
 
 
@@ -87,9 +94,9 @@ def get_product(product_id: int):
     }
 
 
-# GET low stock products
+# GET low stock products (Admin only)
 @router.get("/products/alerts/low-stock")
-def get_low_stock_products(threshold: int = 5):
+def get_low_stock_products(threshold: int = 5, admin_user: dict = Depends(require_admin)):
     db = get_db_connection()
     cursor = db.cursor(dictionary=True)
 
@@ -125,6 +132,7 @@ def add_product(product: Product, admin_user: dict = Depends(require_admin)):
 
     cursor.close()
     db.close()
+    products_cache.invalidate()
 
     return {
         "message": "Product added successfully",
@@ -153,6 +161,7 @@ def update_product(product_id: int, product: Product, admin_user: dict = Depends
     db.commit()
     cursor.close()
     db.close()
+    products_cache.invalidate()
 
     return {
         "message": "Product updated successfully"
@@ -173,6 +182,7 @@ def delete_product(product_id: int, admin_user: dict = Depends(require_admin)):
     db.commit()
     cursor.close()
     db.close()
+    products_cache.invalidate()
 
     return {
         "message": "Product deleted successfully"

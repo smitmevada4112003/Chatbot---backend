@@ -36,7 +36,21 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a plain password against its hashed bcrypt version."""
-    return pwd_context.verify(plain_password, hashed_password)
+    if not plain_password or not hashed_password:
+        return False
+    try:
+        if pwd_context.verify(plain_password, hashed_password):
+            return True
+    except Exception:
+        pass
+
+    try:
+        import bcrypt
+        pw_bytes = plain_password.encode("utf-8")
+        h_bytes = hashed_password.encode("utf-8") if isinstance(hashed_password, str) else hashed_password
+        return bcrypt.checkpw(pw_bytes, h_bytes)
+    except Exception:
+        return False
 
 
 # ==============================================================================
@@ -177,7 +191,8 @@ def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
     FastAPI dependency: uses get_current_user and additionally checks
     that the user's role is 'admin', raising a 403 error otherwise.
     """
-    if current_user.get("role") != "admin":
+    user_role = (current_user.get("role") or "").strip().lower()
+    if user_role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access forbidden: Administrator privileges required."

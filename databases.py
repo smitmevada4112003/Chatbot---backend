@@ -6,33 +6,38 @@ import mysql.connector.pooling
 
 load_dotenv()
 
+import threading
+
 _connection_pool = None
+_pool_lock = threading.Lock()
 
 def get_db_pool():
     global _connection_pool
     if _connection_pool is None:
-        host = os.getenv("DB_HOST", "altaria.proxy.rlwy.net")
-        port = int(os.getenv("DB_PORT", "33460"))
-        user = os.getenv("DB_USER", "root")
-        password = os.getenv("DB_PASSWORD", "zzahymaTnAFOjklYreKaTyctFvhrvvXk")
-        database = os.getenv("DB_NAME", "railway")
+        with _pool_lock:
+            if _connection_pool is None:
+                host = os.getenv("DB_HOST", "altaria.proxy.rlwy.net")
+                port = int(os.getenv("DB_PORT", "33460"))
+                user = os.getenv("DB_USER", "root")
+                password = os.getenv("DB_PASSWORD", "zzahymaTnAFOjklYreKaTyctFvhrvvXk")
+                database = os.getenv("DB_NAME", "railway")
 
-        try:
-            _connection_pool = mysql.connector.pooling.MySQLConnectionPool(
-                pool_name="app_db_pool",
-                pool_size=10,
-                pool_reset_session=False,
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                database=database,
-                connection_timeout=20,
-                use_pure=True
-            )
-        except Exception as e:
-            print(f"[DB Warning] Could not initialize connection pool: {e}")
-            _connection_pool = None
+                try:
+                    _connection_pool = mysql.connector.pooling.MySQLConnectionPool(
+                        pool_name="app_db_pool",
+                        pool_size=3,
+                        pool_reset_session=False,
+                        host=host,
+                        port=port,
+                        user=user,
+                        password=password,
+                        database=database,
+                        connection_timeout=15,
+                        use_pure=True
+                    )
+                except Exception as e:
+                    print(f"[DB Warning] Could not initialize connection pool: {e}")
+                    _connection_pool = None
     return _connection_pool
 
 def get_db_connection():
@@ -41,9 +46,14 @@ def get_db_connection():
         try:
             cnx = pool.get_connection()
             try:
-                cnx.ping(reconnect=True, attempts=2, delay=0.2)
+                cnx.autocommit = True
             except Exception:
                 pass
+            if not cnx.is_connected():
+                try:
+                    cnx.ping(reconnect=True, attempts=1, delay=0.1)
+                except Exception:
+                    pass
             return cnx
         except Exception:
             pass
@@ -55,15 +65,20 @@ def get_db_connection():
     password = os.getenv("DB_PASSWORD", "zzahymaTnAFOjklYreKaTyctFvhrvvXk")
     database = os.getenv("DB_NAME", "railway")
 
-    return mysql.connector.connect(
+    cnx = mysql.connector.connect(
         host=host,
         port=port,
         user=user,
         password=password,
         database=database,
-        connection_timeout=20,
+        connection_timeout=15,
         use_pure=True
     )
+    try:
+        cnx.autocommit = True
+    except Exception:
+        pass
+    return cnx
 
 def ensure_stock_column(db=None):
     """Ensures the 'stock' column exists on the products table."""
@@ -361,8 +376,9 @@ def run_startup_migrations():
     except Exception as e:
         print(f"[DB Warning] Could not run startup migrations: {e}")
 
-# Run schema and data normalization on module load using single connection
-run_startup_migrations()
+# Note: Migrations have already run and tables exist in database.
+# Do not run synchronously on import to avoid blocking application startup.
+# run_startup_migrations()
 
 
 

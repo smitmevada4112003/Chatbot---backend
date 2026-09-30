@@ -7,6 +7,7 @@ from databases import get_db_connection
 from auth import get_current_user, get_optional_current_user, require_admin
 from websocket_manager import manager, broadcast_new_order, safe_broadcast_new_order
 from email_utils import send_low_stock_alert, LOW_STOCK_THRESHOLD
+from cache_utils import orders_cache, products_cache
 
 router = APIRouter()
 
@@ -48,6 +49,9 @@ class Order(BaseModel):
 
 @router.get("/orders")
 def get_orders():
+    cached = orders_cache.get("all_orders")
+    if cached is not None:
+        return cached
 
     db = get_db_connection()
     cursor = db.cursor()
@@ -72,6 +76,7 @@ def get_orders():
     cursor.close()
     db.close()
 
+    orders_cache.set("all_orders", orders, ttl=3.0)
     return orders
 
 
@@ -333,6 +338,9 @@ def add_order(
     with _orders_lock:
         _recent_orders_cache[dedup_key] = (time.time(), response_payload)
 
+    orders_cache.invalidate()
+    products_cache.invalidate()
+
     # Return response immediately
     return response_payload
 
@@ -344,24 +352,31 @@ def add_order(
 
 @router.get("/orders/summary")
 def get_orders_summary(admin_user: dict = Depends(require_admin)):
+    cached = orders_cache.get("summary")
+    if cached is not None:
+        return cached
 
     db = get_db_connection()
     cursor = db.cursor()
 
-    # 1. Total number of orders
-    cursor.execute("SELECT COUNT(*) FROM orders")
-    total_orders_row = cursor.fetchone()
-    total_orders = int(total_orders_row[0]) if total_orders_row and total_orders_row[0] is not None else 0
+    # 1. Total orders, status counts, and total revenue in ONE fast grouped query
+    cursor.execute("""
+        SELECT 
+            LOWER(TRIM(status)), 
+            COUNT(*), 
+            COALESCE(SUM(total_amount), 0)
+        FROM orders 
+        GROUP BY LOWER(TRIM(status))
+    """)
+    status_rows = cursor.fetchall()
 
-    # 2. Total number of products
+    # 2. Total products count
     cursor.execute("SELECT COUNT(*) FROM products")
     total_products_row = cursor.fetchone()
     total_products = int(total_products_row[0]) if total_products_row and total_products_row[0] is not None else 0
 
-    # 3. Count of orders by status (case-insensitive SQL grouping + Python normalization)
-    cursor.execute("SELECT LOWER(TRIM(status)), COUNT(*) FROM orders GROUP BY LOWER(TRIM(status))")
-    status_rows = cursor.fetchall()
-
+    total_orders = 0
+    total_revenue = 0.0
     status_counts = {
         "Pending": 0,
         "Completed": 0,
@@ -371,30 +386,26 @@ def get_orders_summary(admin_user: dict = Depends(require_admin)):
     for row in status_rows:
         raw_status = row[0] or ""
         count = int(row[1] or 0)
+        rev = float(row[2] or 0.0)
+        total_orders += count
+        total_revenue += rev
         norm_key = normalize_status(raw_status)
         if norm_key in status_counts:
             status_counts[norm_key] += count
         else:
             status_counts[norm_key] = count
 
-    # 4. Total revenue (sum of price * quantity for all orders, joined with products table)
-    cursor.execute("""
-        SELECT COALESCE(SUM(o.quantity * p.price), 0)
-        FROM orders o
-        JOIN products p ON LOWER(TRIM(o.product)) = LOWER(TRIM(p.name))
-    """)
-    rev_row = cursor.fetchone()
-    total_revenue = int(rev_row[0]) if rev_row and rev_row[0] is not None else 0
-
     cursor.close()
     db.close()
 
-    return {
+    result = {
         "total_orders": total_orders,
         "total_products": total_products,
         "status_counts": status_counts,
-        "total_revenue": total_revenue
+        "total_revenue": int(round(total_revenue))
     }
+    orders_cache.set("summary", result, ttl=3.0)
+    return result
 
 
 # =========================
@@ -491,6 +502,8 @@ def update_order(order_id: int, order: Order, admin_user: dict = Depends(require
     except Exception:
         pass
 
+    orders_cache.invalidate()
+
     return {
         "message": "Order updated successfully",
         "status": clean_status
@@ -526,6 +539,8 @@ def delete_order(order_id: int, admin_user: dict = Depends(require_admin)):
         })
     except Exception:
         pass
+
+    orders_cache.invalidate()
 
     return {
         "message": "Order deleted successfully"
@@ -576,6 +591,9 @@ def update_order_status(order_id: int, payload: OrderStatusUpdate, admin_user: d
         })
     except Exception:
         pass
+
+    orders_cache.invalidate()
+    products_cache.invalidate()
 
     return {
         "message": "Status updated successfully",
@@ -631,6 +649,9 @@ def cancel_order_endpoint(order_id: int, admin_user: dict = Depends(require_admi
     except Exception:
         pass
 
+    orders_cache.invalidate()
+    products_cache.invalidate()
+
     return {
         "status": "success",
         "message": f"Order #{order_id} has been Cancelled and inventory restored.",
@@ -673,6 +694,8 @@ def bulk_delete_orders(payload: BulkDeleteRequest, admin_user: dict = Depends(re
         })
     except Exception:
         pass
+
+    orders_cache.invalidate()
 
     return {
         "message": f"Successfully deleted {deleted_count} orders",
